@@ -46,3 +46,11 @@ video_chatbot/
 ├── .env.example        # Template for .env
 ├── .gitignore          # Excludes .env and cache files
 └── README.md           # This file
+
+
+Known Limitations
+
+Only the first 12,000 characters of the transcript are used for summarisation
+Videos without captions cannot be transcribed (Whisper integration is a future enhancement)
+Chroma is in-memory — the vector index is rebuilt each time the app restarts or a new video is loaded
+Session memory is lost on page refresh
