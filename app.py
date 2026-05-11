@@ -1,6 +1,8 @@
 import streamlit as st
 import re
+import os
 from typing import Annotated, TypedDict, List
+
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -15,16 +17,16 @@ from youtube_transcript_api import (
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
-import os
-
 
 load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -34,8 +36,19 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Environment guards ─────────────────────────────────────────────────────────
+if not GROQ_API_KEY:
+    st.error(
+        "**GROQ API key not found.**\n\n"
+        "Add to your `.env`:\n```\nGROQ_API_KEY=gsk_...\n```\nThen restart."
+    )
+    st.stop()
+
 if not APP_PASSWORD:
-    st.error("**App password not set.**\n\n")
+    st.error(
+        "**App password not set.**\n\n"
+        "Add to your `.env`:\n```\nAPP_PASSWORD=your-password\n```\nThen restart."
+    )
     st.stop()
 
 # ── Password gate ──────────────────────────────────────────────────────────────
@@ -43,7 +56,7 @@ if not st.session_state.get("authenticated"):
     st.title("🔒 Video Transcript Chatbot")
     st.markdown("Please enter the password to continue.")
     pwd = st.text_input("Password", type="password", placeholder="Enter password…")
-    if st.button("Unlock", use_container_width=False):
+    if st.button("Unlock"):
         if pwd == APP_PASSWORD:
             st.session_state.authenticated = True
             st.rerun()
@@ -51,25 +64,23 @@ if not st.session_state.get("authenticated"):
             st.error("❌ Incorrect password. Please try again.")
     st.stop()
 
+
 # ── Constants ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 500  # characters per chunk
-CHUNK_OVERLAP = 50  # overlap between chunks
-TOP_K = 5  # chunks retrieved per query
-WINDOW_SIZE = 6  # messages kept in sliding window memory (3 exchanges)
-CHROMA_COLLECTION = "transcript"
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+TOP_K = 5
+WINDOW_SIZE = 6
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
 def extract_video_id(url: str) -> str | None:
-    """Extract YouTube video ID from various URL formats."""
     m = re.search(r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else None
 
 
 def fetch_transcript(video_id: str) -> str:
-    """Fetch transcript text from YouTube (v1.x instance-based API)."""
     api = YouTubeTranscriptApi()
     transcript_list = api.list(video_id)
     try:
@@ -80,11 +91,8 @@ def fetch_transcript(video_id: str) -> str:
     return " ".join(snippet.text for snippet in fetched)
 
 
-def build_vectorstore(transcript: str) -> Chroma:
-    """
-    Split transcript → embed → store in Chroma (in-memory).
-    Cached per video_id so rebuilding only happens when the video changes.
-    """
+def build_vectorstore(transcript: str) -> FAISS:
+    """Split transcript → embed → store in FAISS in-memory."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -92,26 +100,28 @@ def build_vectorstore(transcript: str) -> Chroma:
     )
     chunks = splitter.create_documents(texts=[transcript])
 
-    embeddings = HuggingFaceEmbeddings()
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+    )
 
-    return Chroma.from_documents(
+    return FAISS.from_documents(
         documents=chunks,
         embedding=embeddings,
     )
 
 
-def retrieve_context(vectorstore: Chroma, query: str) -> str:
-    """Semantic search → return top-k chunks joined as context string."""
+def retrieve_context(vectorstore: FAISS, query: str) -> str:
+    """Semantic search → return top-k chunks joined as a context string."""
     docs = vectorstore.similarity_search(query, k=TOP_K)
     return "\n\n---\n\n".join(d.page_content for d in docs)
 
 
 def windowed_messages(history: InMemoryChatMessageHistory) -> list:
-    """Return the last WINDOW_SIZE messages from memory."""
     return history.messages[-WINDOW_SIZE:]
 
 
-# ── LangGraph state & graph ─────────────────────────────────────────────────────
+# ── LangGraph ──────────────────────────────────────────────────────────────────
 
 
 class ChatState(TypedDict):
@@ -119,34 +129,30 @@ class ChatState(TypedDict):
     transcript: str
     summary: str
     mode: str  # "summarise" | "qa"
-    query: str  # current user question (for retrieval)
-    context: str  # retrieved chunks
+    query: str
+    context: str
 
 
-def build_graph(vectorstore: Chroma, memory: InMemoryChatMessageHistory):
+def build_graph(vectorstore: FAISS, memory: InMemoryChatMessageHistory):
     llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
 
-    # ── Node: retrieve ───────────────────────────────────────────────────────
     def retrieve_node(state: ChatState) -> ChatState:
         context = retrieve_context(vectorstore, state["query"])
         return {**state, "context": context}
 
-    # ── Node: summarise ──────────────────────────────────────────────────────
     def summarise_node(state: ChatState) -> ChatState:
-        transcript = state["transcript"]
         system = SystemMessage(
             content=(
                 "You are an expert video analyst. "
-                "When given a transcript, produce a clear, well-structured summary with:\n"
+                "Produce a clear, well-structured summary with:\n"
                 "1. **Overview** – one-paragraph high-level summary\n"
                 "2. **Key Points** – bullet list of the main ideas\n"
                 "3. **Conclusion** – what the video concludes or recommends\n"
                 "Be concise yet comprehensive."
             )
         )
-        # For summarise, use full transcript (chunked context covers everything)
         user = HumanMessage(
-            content=f"Summarise this video transcript:\n\n{transcript[:12000]}"
+            content=f"Summarise this video transcript:\n\n{state['transcript'][:12000]}"
         )
         response = llm.invoke([system, user])
         summary_text = response.content
@@ -157,50 +163,59 @@ def build_graph(vectorstore: Chroma, memory: InMemoryChatMessageHistory):
             "messages": state["messages"] + [AIMessage(content=summary_text)],
         }
 
-    # ── Node: answer question ────────────────────────────────────────────────
     def qa_node(state: ChatState) -> ChatState:
         context = state.get("context", "").strip()
         summary = state.get("summary", "").strip()
- 
+
         # Build the best context available — retrieved chunks first,
         # fall back to transcript slice so Q&A works before summarise is run
         if context:
             context_section = f"### Retrieved Transcript Chunks\n{context}"
         else:
-            context_section = f"### Transcript (first 12 000 chars)\n{state['transcript'][:12000]}"
- 
+            context_section = (
+                f"### Transcript (first 12 000 chars)\n{state['transcript'][:12000]}"
+            )
+
         summary_section = (
             f"### Video Summary\n{summary}"
-            if summary else
-            "### Video Summary\nNot yet generated — answer from the transcript above."
+            if summary
+            else "### Video Summary\nNot yet generated — answer from the transcript above."
         )
- 
-        system = SystemMessage(content=(
-            "You are a helpful assistant answering questions about a video.\n"
-            "Use the transcript content below to answer accurately. "
-            "If the answer genuinely isn't in the provided content, say so politely.\n\n"
-            f"{context_section}\n\n{summary_section}"
-        ))
- 
+
+        system = SystemMessage(
+            content=(
+                "You are a strict assistant that answers questions ONLY from the video transcript provided below.\n\n"
+                "RULES — follow these absolutely, no exceptions:\n"
+                "1. ONLY use information from the transcript content below to answer.\n"
+                "2. NEVER use your own knowledge, training data, or anything outside the transcript.\n"
+                "3. If the question cannot be answered from the transcript, respond with exactly: "
+                "'I can only answer questions about this video. That information is not covered in the transcript.'\n"
+                "4. Do NOT guess, infer, or fill gaps with general knowledge.\n"
+                "5. Do NOT answer general knowledge questions, even if you know the answer.\n\n"
+                f"{context_section}\n\n{summary_section}"
+            )
+        )
+
         history_msgs = windowed_messages(memory)
-        messages_for_llm = [system] + history_msgs + [HumanMessage(content=state["query"])]
+        messages_for_llm = (
+            [system] + history_msgs + [HumanMessage(content=state["query"])]
+        )
         response = llm.invoke(messages_for_llm)
         ai_content = response.content
         memory.add_ai_message(ai_content)
-        return {**state, "messages": state["messages"] + [AIMessage(content=ai_content)]}
-    # ── Router ───────────────────────────────────────────────────────────────
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=ai_content)],
+        }
+
     def router(state: ChatState) -> str:
         return state["mode"]
 
-    # ── Build graph ──────────────────────────────────────────────────────────
     g = StateGraph(ChatState)
     g.add_node("retrieve", retrieve_node)
     g.add_node("summarise", summarise_node)
     g.add_node("qa", qa_node)
-
-    # summarise: skip retrieval (uses full transcript directly)
-    # qa: retrieve first, then answer
-    g.set_conditional_entry_point(router, {"summarise": "summarise", "qa": "qa"})
+    g.set_conditional_entry_point(router, {"summarise": "summarise", "qa": "retrieve"})
     g.add_edge("retrieve", "qa")
     g.add_edge("summarise", END)
     g.add_edge("qa", END)
@@ -208,16 +223,15 @@ def build_graph(vectorstore: Chroma, memory: InMemoryChatMessageHistory):
 
 
 # ── Session state defaults ─────────────────────────────────────────────────────
-defaults = {
+for k, v in {
     "transcript": "",
     "summary": "",
-    "chat_history": [],  # list of {"role": "user"|"assistant", "content": str}
+    "chat_history": [],
     "video_loaded": False,
     "video_id": "",
-    "memory": None,  # InMemoryChatMessageHistory
+    "memory": None,
     "vectorstore": None,
-}
-for k, v in defaults.items():
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -287,10 +301,8 @@ with st.sidebar:
                     st.session_state.chat_history = []
                     st.session_state.memory = InMemoryChatMessageHistory()
                     st.session_state.vectorstore = vectorstore
-                    chunk_count = vectorstore._collection.count()
-                    st.success(
-                        f"✅ Ready! {len(transcript):,} chars indexed into {chunk_count} chunks."
-                    )
+                    chunk_count = vectorstore.index.ntotal
+                    st.success(f"✅ Ready! {len(transcript):,} chars indexed.")
 
     if st.session_state.video_loaded:
         st.divider()
@@ -319,20 +331,22 @@ with st.sidebar:
                 )
                 st.rerun()
 
-        # RAG info
         with st.expander("🔍 RAG & Memory Info", expanded=False):
+            chunk_count = (
+                st.session_state.vectorstore.index.ntotal
+                if st.session_state.vectorstore
+                else 0
+            )
             st.markdown(f"""
 **Splitter:** `RecursiveCharacterTextSplitter`  
 **Chunk size:** {CHUNK_SIZE} chars  
 **Overlap:** {CHUNK_OVERLAP} chars  
 **Embeddings:** `all-MiniLM-L6-v2` (local)  
-**Vector DB:** Chroma (in-memory)  
+**Vector DB:** FAISS (in-memory)  
 **Top-K retrieval:** {TOP_K} chunks  
 **Memory:** Sliding window — last {WINDOW_SIZE} messages  
+**Chunks indexed:** {chunk_count}
             """)
-            if st.session_state.vectorstore:
-                count = st.session_state.vectorstore._collection.count()
-                st.metric("Chunks indexed", count)
 
         with st.expander("📄 Raw Transcript", expanded=False):
             st.text_area(
@@ -356,9 +370,9 @@ if not st.session_state.video_loaded:
     st.markdown("""
     ### How to get started
     1. **Paste a YouTube URL** in the sidebar (video must have captions)
-    2. Click **Load** — the transcript is fetched and indexed into Chroma
-    3. Hit **Summarise Video** for a structured overview, or
-    4. **Ask any question** — the app retrieves the most relevant chunks and answers
+    2. Click **Load** — transcript is fetched and indexed automatically
+    3. **Ask questions straight away** — no need to summarise first
+    4. Optionally hit **Summarise Video** for a structured overview
     """)
     c1, c2, c3 = st.columns(3)
     c1.info("**📝 Summarise**\nGet a structured overview in seconds")
@@ -375,7 +389,7 @@ else:
 
     if not st.session_state.chat_history:
         st.caption(
-            "No messages yet. Ask a question or click **Summarise Video** in the sidebar."
+            "No messages yet — ask anything about the video, or click **Summarise Video** in the sidebar."
         )
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
@@ -385,13 +399,11 @@ else:
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         st.session_state.memory.add_user_message(prompt)
 
-        lc_messages = [HumanMessage(content=prompt)]
-
         with st.spinner("Retrieving & thinking…"):
             graph = build_graph(st.session_state.vectorstore, st.session_state.memory)
             result = graph.invoke(
                 {
-                    "messages": lc_messages,
+                    "messages": [HumanMessage(content=prompt)],
                     "transcript": st.session_state.transcript,
                     "summary": st.session_state.summary,
                     "mode": "qa",
